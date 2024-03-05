@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+desc = "A UDP socket reader of NOAAPort SBN data"
+
 # Copyright (c) 2024 Michael Leon ( in service of the
 #   Global Systems Laboratory (GSL) within the
 #   Earth Systems Research Laboratory (ESRL) under the
@@ -22,9 +24,7 @@ from collections import namedtuple
 from argparse import ArgumentParser
 from datetime import datetime, timezone
 
-desc = "A UDP socket reader of NOAAPort SBN data"
 class Noaaport:
-
   channels = list(range(1,12)) 
 
   flh_meta = namedtuple('FrameLevelHeader', 'HDLC_address HDLC_control SBN_version SBN_control'
@@ -53,11 +53,12 @@ class Noaaport:
 
   PROD_CAT = { 1: 'TEXT', 2: 'GRAPHIC', 3: 'IMAGE', 4: 'GRID', 5: 'POINT', 6: 'BINARY' } 
 
-  def __init__(self, channel: int, dest: str):
+  def __init__(self, channel: int, dest: str, verbose: int = 0):
       self.set_channel(channel)
       self.filepath = None
       self.data_dir = os.path.join(dest, self.channel) 
       if not os.path.isdir(self.data_dir): os.makedirs(self.data_dir) 
+      self.verbose = verbose
       self.connect_to_socket()
       self.wait_for_data()
 
@@ -76,49 +77,50 @@ class Noaaport:
       self.sock.bind(('', self.port)) 
       mreq = struct.pack("sl", socket.inet_aton(self.ip), socket.INADDR_ANY) 
       self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq) 
+      s_print(f'{datetime.utcnow()} Opening a socket to {self.ip}:{self.port} while listening to noaaport channel {self.channel}')
+
       catchable_sigs = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
       for sig in catchable_sigs:
         signal.signal(sig, self.handler)
 
   def handler(self, signum: int, frame: 'current stack frame object'):
       signame = signal.Signals(signum).name
-      print(f'Signal handler called with signal name:{signame}, num:{signum}')
+      s_print(f'{datetime.utcnow()} Signal handler called with signal name:{signame}, num:{signum}')
       self.stop_listening()
       os._exit(0) 
 
   def stop_listening(self):
-      print('closing socket we were listening on.. %s:%d' % (self.ip, self.port))
+      s_print(f'{datetime.utcnow()} closing socket we were listening on.. %s:%d' % (self.ip, self.port))
       self.sock.shutdown
       self.sock.close()
       if self.filepath != None: 
         self.sbn_message.close()
-        self.sbn_json.close()
+        self.write_json()
 
   def read_time_sync(self, time_sync_raw: bytes):
       time_sync = Noaaport.time_sync_meta(*Noaaport.time_sync_struct.unpack(time_sync_raw)) 
       this_date = datetime.utcfromtimestamp(time_sync.time_send)
-      s_print(f' Receiving Time Sync Packet: {this_date}, offset: {(datetime.utcnow() - this_date)})')
+      if self.verbose: s_print(f'** Time Sync Packet: {this_date}, offset: {(datetime.utcnow() - this_date)})')
 
   def read_frame_header(self, flh_raw: bytes, expected_sbn_seq: int) -> 'flh: namedtuple, expected_sbn_seq: int' :
       flh = Noaaport.flh_meta(*Noaaport.flh_struct.unpack(flh_raw)) 
       if expected_sbn_seq != int(flh.SBN_sequence_number):
         s_print(f'  Received an SBN message/packet out of sequence! Expected {expected_sbn_seq}, got {flh.SBN_sequence_number}')
       expected_sbn_seq = int(flh.SBN_sequence_number) + 1 
-      if args.verbose >= 2: s_print('    FLH:', [flh.__getattribute__(i) for i in flh._fields])
+      if self.verbose >= 3: s_print('    FLH:', [flh.__getattribute__(i) for i in flh._fields])
       return flh, expected_sbn_seq
 
-  def read_sbn_header(self, sbn_raw: bytes, product_seq: int) -> 'sbn: namedtuple, product_seq: int' :
+  def read_sbn_header(self, sbn_raw: bytes) -> 'sbn: namedtuple' :
       sbn = Noaaport.sbn_meta(*Noaaport.sbn_struct.unpack(sbn_raw)) 
-      if args.verbose: s_print( f' flh.SBN_seq#: {self.flh.SBN_sequence_number} sbn: Product_seq#:'
+      if self.verbose >= 2: s_print( f' flh.SBN_seq#: {self.flh.SBN_sequence_number} sbn: Product_seq#:'
                 f'{sbn.Product_sequence_number} Block#:{sbn.Block_number} data_size:{sbn.Data_block_size}'
                 f' Header_len:{sbn.Header_length} Transfer_type:{sbn.Transfer_type}' )
-      if args.verbose >= 2: s_print('    SBN:', [sbn.__getattribute__(i) for i in sbn._fields])
-      product_seq = sbn.Product_sequence_number 
-      return sbn, product_seq 
+      if self.verbose >= 3: s_print('    SBN:', [sbn.__getattribute__(i) for i in sbn._fields])
+      return sbn
 
   def read_psh_header(self, psh_raw: bytes) -> 'psh: namedtuple':
       psh = Noaaport.psh_meta(*Noaaport.psh_struct.unpack(psh_raw)) 
-      if args.verbose >= 2:
+      if self.verbose >= 3:
         s_print(f'    PSH:', [psh.__getattribute__(i) for i in psh._fields], end='')
         s_print(f' recv:{human_time(psh.recv_time)} send:{human_time(psh.send_time)}')
       return psh 
@@ -128,12 +130,12 @@ class Noaaport:
       try:
         wmo_size = wmo_raw.rindex(b'\r\r\n') + 3
       except ValueError as ve:
-        if args.verbose >= 2: s_print(f'wmo header does not end in "\r\r\n", {ve}. Attempting "\n" instead.')
+        if self.verbose >= 3: s_print(f'wmo header does not end in "\r\r\n", {ve}. Attempting "\n" instead.')
         wmo_size = wmo_raw.rindex(b'\n') + 1
       except Error as e:
         s_print(f'Error parsing WMO. {e}\n{wmo_raw} {wmo_size}')
       wmo_raw_trim = f'{wmo_raw[:wmo_size]}' 
-      wmo_header = wmo_raw[:wmo_size].replace(b'\r\r\n', b' ').decode().strip()
+      wmo_header = wmo_raw[:wmo_size].replace(b'\r\r\n', b' ').replace(b'\r\n', b' ').decode().strip()
       wmo_header = wmo_header[:4] + ' ' + wmo_header[4:] 
       rstation, wmo_id, station, ddhhmm = wmo_header.split(maxsplit=3)
       yearm = datetime.now().strftime("%Y%m")
@@ -142,8 +144,8 @@ class Noaaport:
       if len(ddhhmm) > 6:
         channel = ddhhmm[7:]
       wmo = self.wmo_meta(wmo_header, rstation, wmo_id, station, ddhhmm[:6], channel, Ymd, wmo_size)
-      if args.verbose:      s_print(f'    WMO Header: {wmo_header} size: {wmo_size} raw:{wmo_raw_trim}')
-      if args.verbose >= 2: s_print(f'    WMO:', [wmo.__getattribute__(i) for i in wmo._fields])
+      if self.verbose >= 2:      s_print(f'    WMO Header: {wmo_header} size: {wmo_size} raw:{wmo_raw_trim}')
+      if self.verbose >= 3: s_print(f'    WMO:', [wmo.__getattribute__(i) for i in wmo._fields])
       return wmo, wmo_raw_trim
 
   def read_first_packet(self, data: bytes):
@@ -153,13 +155,15 @@ class Noaaport:
       wmo, wmo_raw = self.read_wmo_header(data[wmo_start:wmo_start+40]) 
       data_start = wmo_start + wmo.size
       ext = get_extension(data[data_start:data_start+8]) 
-      if ext == 'none':
-        if Noaaport.nexrad_l3_wmo_finder.search(wmo.header):
+      if ext == 'ncf.txt':
+          if self.verbose: s_print(f'** NCF Status Message:\n{data[data_start:].decode()}')
+          return
+      elif ext == 'none' and Noaaport.nexrad_l3_wmo_finder.search(wmo.header):
           ext = 'nexrad_l3'
       filename = '.'.join(['NOAAPORT', prod_cat, wmo.wmo_id, wmo.station, wmo.ymd[6:8]+wmo.ymd[9:],
                   datetime.now().strftime("%Y%j%H%M%S%f")[:-3], wmo.awips, ext]).replace('..', '.')
       self.filepath = os.path.join(self.data_dir, filename)
-      s_print(f' Receiving product {self.filepath} ({psh.num_frags} fragments)')
+      if self.verbose: s_print(f' Receiving product {self.filepath} ({psh.num_frags} fragments)')
       self.sbn_message = BytesIO() 
       self.sbn_json = StringIO()   
       self.sbn_message.write(data[data_start:])
@@ -179,43 +183,42 @@ class Noaaport:
         if (self.sbn.Transfer_type in [6, 22]): 
           self.write_data() 
           self.write_json() 
+      elif self.verbose >= 2: s_print(f' Reading data packet without the product spec / info (fragment# {self.sbn.Block_number})')
 
   def wait_for_data(self):
-      expected_sbn_sequence = product_sequence = 0
-      s_print(f'{datetime.utcnow()} Opening a socket to {self.ip}:{self.port} while listening to noaaport channel {self.channel}')
+      expected_sbn_sequence = 0
       while True: 
-        data, addr = self.sock.recvfrom(65507) 
-        host, port = addr 
-        packet_size = len(data)
-        self.packet_meta = (f'{datetime.utcnow()} Received packet({packet_size}) on {self.ip}:{self.port} (channel:'
+        data, (host, port) = self.sock.recvfrom(65507) 
+        self.packet_meta = (f'{datetime.utcnow()} Received packet ({len(data)} bytes) on {self.ip}:{self.port} (channel:'
           f' {self.channel}) from {host}:{port}')
-        if args.verbose >= 2: s_print(self.packet_meta)
+        if self.verbose >= 3: s_print(self.packet_meta)
 
         self.flh, expected_sbn_sequence = self.read_frame_header(data[:16], expected_sbn_sequence) 
         if self.flh.SBN_command == 5: 
           self.read_time_sync(data[16:])
           continue
 
-        self.sbn, product_sequence = self.read_sbn_header(data[16:32], product_sequence) 
+        self.sbn = self.read_sbn_header(data[16:32]) 
         if self.sbn.Header_length == 16: 
           self.read_data_packet(data)
           continue
 
         if self.sbn.Block_number == 0: 
           self.read_first_packet(data)
+          continue
+
+        if self.verbose: s_print(f'We shouldnt have gotten this far but..meta: {self.packet_meta}, flh: {self.flh}; and all known cases handled.')
 
   def write_data(self): 
-      if args.verbose: s_print(f'    writing sbn_message to file {self.filepath} of size '
+      if self.verbose >= 2: s_print(f'    writing sbn_message to file {self.filepath} of size '
         f'{human_size(len(self.sbn_message.getbuffer()))}')
-      file_mode = 'wb'
-      with open(self.filepath, file_mode) as data_file:
+      with open(self.filepath, 'wb') as data_file:
         data_file.write(self.sbn_message.getvalue()) 
       self.sbn_message.close() 
 
   def write_json(self): 
-      if args.verbose: s_print(f'    writing metadata to file {self.filepath}.json')
-      file_mode = 'w'
-      with open(self.filepath + '.json', file_mode) as json_file:
+      if self.verbose >= 2: s_print(f'    writing metadata to file {self.filepath}.json')
+      with open(self.filepath + '.json', 'w') as json_file:
         json_file.write(self.sbn_json.getvalue()) 
       self.sbn_json.close() 
       self.filepath = None 
@@ -242,11 +245,10 @@ def get_extension(first_bytes: bytes) -> str:
         ext = 'xml'
     return ext
 
-def human_time(epoch_secs: int) -> str:
+def human_time(epoch_secs: int) -> 'A human readable date/time string':
     my_struct = gmtime(epoch_secs)
     my_time = datetime(*my_struct[:6], tzinfo=timezone.utc)
-    my_str = my_time.strftime('%Y_%m_%d_%H:%M:%S')
-    return my_str
+    return my_time.strftime('%Y_%m_%d_%H:%M:%S')
 
 def human_size(fsize: str, units=[' bytes','KB','MB','GB','TB', 'PB', 'EB']) -> 'A human readable string representation of bytes':
   return "{:.1f}{}".format(float(fsize), units[0]) if float(fsize) < 1024 else human_size(fsize / 1024, units[1:])
@@ -262,15 +264,14 @@ def setup_arg_parser(description: str) -> ArgumentParser:
       choices=[str(x) for x in Noaaport.channels] + ['all'])
     parser.add_argument('-v', '--verbose', help='Make output more verbose. Can be used '
       'multiple times.', action='count', default=0)
-    parser.add_argument('-d', '--dest', help='Specify the destination directory for downloads '
-      '("ldm:" for pqinserting)', type=str, default='/data/temp/')
+    parser.add_argument('-d', '--dest', help='Specify the destination for received products',
+      type=str, default='/data/temp/')
     return parser
 
 def main():
-    global args
     args = setup_arg_parser(desc).parse_args()
     if args.channel != 'all':
-      n = Noaaport(args.channel, args.dest)
+      n = Noaaport(args.channel, args.dest, args.verbose)
 
 if __name__ == '__main__':
     main()
