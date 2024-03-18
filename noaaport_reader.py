@@ -2,12 +2,7 @@
 
 desc = "A UDP socket reader of NOAAPort SBN data"
 
-# Copyright (c) 2024 Michael Leon ( in service of the
-#   Global Systems Laboratory (GSL) within the
-#   Earth Systems Research Laboratory (ESRL) under the
-#   Office of Atmospheric Research (OAR) of the
-#   United States Department of Commerce's
-#   National Oceanic Atmospheric Administration (NOAA) )
+# Copyright (c) 2024 NOAA ESRL Global Systems Laboratory
 # Distributed under the terms of the BSD 3-Clause License.
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -54,12 +49,12 @@ class Noaaport:
   PROD_CAT = { 1: 'TEXT', 2: 'GRAPHIC', 3: 'IMAGE', 4: 'GRID', 5: 'POINT', 6: 'BINARY' } 
 
   def __init__(self, channel: int, dest: str, verbose: int = 0):
+      self.verbose = verbose
       self.set_channel(channel)
       self.filepath = None
       self.data_dir = os.path.join(dest, self.channel) 
       if not os.path.isdir(self.data_dir): os.makedirs(self.data_dir) 
-      self.verbose = verbose
-      self.connect_to_socket()
+      self.open_socket()
       self.wait_for_data()
 
   def set_channel(self, channel: int):
@@ -71,7 +66,7 @@ class Noaaport:
         self.ip = "224.0.1." + self.channel 
         self.port = 1200 + int(channel)     
 
-  def connect_to_socket(self):
+  def open_socket(self):
       self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) 
       self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 
       self.sock.bind(('', self.port)) 
@@ -161,7 +156,7 @@ class Noaaport:
       elif ext == 'none' and Noaaport.nexrad_l3_wmo_finder.search(wmo.header):
           ext = 'nexrad_l3'
       filename = '.'.join(['NOAAPORT', prod_cat, wmo.wmo_id, wmo.station, wmo.ymd[6:8]+wmo.ymd[9:],
-                  datetime.now().strftime("%Y%j%H%M%S%f")[:-3], wmo.awips, ext]).replace('..', '.')
+                  datetime.utcnow().strftime("%Y%j%H%M%S%f")[:-3], wmo.awips, ext]).replace('..', '.')
       self.filepath = os.path.join(self.data_dir, filename)
       if self.verbose: s_print(f' Receiving product {self.filepath} ({psh.num_frags} fragments)')
       self.sbn_message = BytesIO() 
