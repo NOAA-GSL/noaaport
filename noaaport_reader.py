@@ -56,10 +56,8 @@ multi-homed system. As root, execute the commands::
  sysctl -w net.ipv4.conf.default.rp_filter=1 # or 2
  sysctl -p
 
-Also, Note sysctl changes made by pdinrs RPM install process
-
-In addition, the multicast group must be joined and the transmitting ports must be added to the
-multicast group membership.
+Also, Note that additional sysctl changes may be needed. In addition, the multicast group
+must be joined and the transmitting ports must be added to the multicast group membership.
 
 Json Meta Reference
 ###################
@@ -611,9 +609,6 @@ def profile_main():
         profiler.dump_stats('cProfile.noaaport.log')
     p = pstats.Stats("cProfile.noaaport.log")
     p.sort_stats("cumulative").print_stats()
-    # cProfile.run('main()', 'cProfile.noaaport.log')
-    # p = pstats.Stats("cProfile.noaaport.log")
-    # p.sort_stats("cumulative").print_stats()
 
 if __name__ == '__main__':
     main()
