@@ -575,7 +575,7 @@ def main():
     channels = [args.channel] if args.channel != 'all' else Reader.CHANNELS
     worker = Worker(args)
     for ch in channels:
-        Reader(ch, worker.queue, args.dest, args.logdir, args.verbose)
+        Reader(ch, worker.queue, args.logdir, args.verbose)
     worker.start()
     loop = asyncio.get_event_loop()
     try:
