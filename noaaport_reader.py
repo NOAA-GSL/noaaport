@@ -57,37 +57,25 @@ multi-homed system. As root, execute the commands::
  sysctl -w net.ipv4.conf.default.rp_filter=1 # or 2
  sysctl -p
 
-Also, Note that additional sysctl changes may be needed. In addition, the multicast group must
-be joined and the transmitting ports must be added to the multicast group membership.
+Note that additional sysctl changes may be needed.
 
-Json Meta Reference
-###################
-To read the json metadata, note that each file contains multiple json objects - one for each packet
-that makes up a product. One way to read in the json formatted metadata files is shown below.
-
-.. code:: python
-
-  prod = []
-  with open('<filename>', 'r') as f:
-    content = f.read()
-    for packet in content.replace('},{', '}PACKET_SEP{').split('PACKET_SEP'):
-      prod.append(json.loads(packet))
-
-file signature info
-  - https://en.wikipedia.org/wiki/List_of_file_signatures
-  - https://www.garykessler.net/library/file_sigs.html
+The local network interface IP that connects to the SBN modem must be defined via the LOCAL_IP variable.
+On linux systems, get_local_ip() attempts to arrive at this ip, as the first private address found
+(excluding 127.0.0.1). But this method can be ignored or removed and the LOCAL_IP can be set manually instead.
 
 Code
 ####
 '''
 
-import os
 import re
+import sys
 import json
 import signal
 import socket
 import logging
 import asyncio
+import ipaddress
+import subprocess
 from queue import Queue
 from time import gmtime
 from pathlib import Path
@@ -95,11 +83,21 @@ from threading import Thread
 from struct import Struct, pack
 from io import BytesIO, StringIO
 from collections import namedtuple
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from datetime import datetime, timezone
-from typing import Tuple, Any, NamedTuple
+from typing import Tuple, NamedTuple, IO
 
-DESC = "A UDP socket reader of the NOAAPort SBN data stream"
+DESC = "A UDP socket (or asyncio.DatagramProtocol) reader of the NOAAPort SBN multicast data stream"
+
+def get_local_ip():
+    '''To properly join each multicast group, we need the interface IP that routes to the SBN modem.
+    Optionally, review 'ifconfig -a' output and manually set LOCAL_IP below to the SBN interface IP'''
+    for ip in subprocess.getoutput('hostname -I').strip().split(' '):
+        if ip == 'hostname:': return None # some systems do not support the -I option to hostname
+        if ip != '127.0.0.1' and ipaddress.ip_address(ip).is_private:
+            return ip
+
+LOCAL_IP = get_local_ip() or '127.0.0.1' # The SBN interface ip is needed to join each multicast group
 
 class Header:
     '''Defines the NOAAPort header structures, variable names, and how to read them.\n
@@ -209,9 +207,9 @@ class Header:
 
     time_sync_struct = Struct('!2B ? B I 10s 10x L')
 
-    def read_frame(self, flh_raw: bytes, expected_sbn_seq: int, verbose:int = 0) -> Tuple[namedtuple, int]:
+    def read_frame(self, flh_raw:bytes, expected_sbn_seq:int, verbose:int = 0) -> Tuple[namedtuple, int]:
         '''Given a raw set of bytes (expects the first 16 bytes of a NOAAPort packet) and an expected sbn sequence,
-        read the Frame Level Header and calculate the next expected sbn sequence. \n
+        read the Frame Level Header and calculate the next expected sbn sequence. 
         This and other NOAAPort headers are unpacked into their expected _struct(ures), and assigned to their
         defined (NamedTuple subclassed) variables.\n
         Track the expected_sbn_sequence, make sure it increments by 1 (not sure where we're joining in the sbn sequencing).
@@ -225,7 +223,7 @@ class Header:
         if verbose >= 3: self.logger.debug(f'  FLH: {[getattr(flh, i) for i in flh._fields]}')
         return flh, expected_sbn_seq
 
-    def read_sbn(self, sbn_raw: bytes, verbose:int = 0) -> namedtuple:
+    def read_sbn(self, sbn_raw:bytes, verbose:int = 0) -> namedtuple:
         '''Given a raw set of bytes (expects bytes 16:32 of a NOAAPort packet), read the Satellite Broadcast Network Header'''
         sbn = self.SatelliteBroadcastNetworkHeader(*self.sbn_struct.unpack(sbn_raw))
         if verbose >= 2: self.logger.debug(f' flh.SBN_seq#: {self.flh.SBN_sequence_number} sbn: '
@@ -234,7 +232,7 @@ class Header:
         if verbose >= 3: self.logger.debug(f'  SBN: {[getattr(sbn, i) for i in sbn._fields]}')
         return sbn
 
-    def read_product(self, psh_raw: bytes, verbose:int = 0) -> namedtuple:
+    def read_product(self, psh_raw:bytes, verbose:int = 0) -> namedtuple:
         '''Given a raw set of bytes (expects bytes 32:58 of a NOAAPort packet), read the Product Specification Header'''
         psh = self.ProductSpecHeader(*self.psh_struct.unpack(psh_raw))
         if verbose >= 3:
@@ -242,7 +240,7 @@ class Header:
             self.logger.debug(f' recv:{human_time(psh.recv_time)} send:{human_time(psh.send_time)}')
         return psh
 
-    def read_wmo(self, wmo_raw: bytes, verbose:int = 0) -> namedtuple:
+    def read_wmo(self, wmo_raw:bytes, verbose:int = 0) -> namedtuple:
         '''Given a raw set of bytes, read the World Meteorological Organization Header (aka, the "COMMS" header)\n
         Expects 40ish bytes of a NOAAPort packet - whose start is based on the Header_length and psh_size '''
         wmo_size = len(wmo_raw)
@@ -268,17 +266,16 @@ class Header:
         if verbose >= 3: self.logger.debug(f'  WMO: {[getattr(wmo, i) for i in wmo._fields]}')
         return wmo
 
-    def read_time_sync(self, time_sync_raw: bytes, verbose:int = 0):
+    def read_time_sync(self, time_sync_raw:bytes, verbose:int = 0):
         '''Given a raw set of bytes, read the time synchronization packet'''
         time_sync = self.TimeSyncHeader(*self.time_sync_struct.unpack(time_sync_raw))
         this_date = datetime.fromtimestamp(time_sync.time_send, timezone.utc)
         if verbose: self.logger.debug(f'** ch.{self.channel} Time Sync Packet: {this_date}, offset:'
                                  f' {(datetime.now(timezone.utc) - this_date)})')
 
-class Protocol(asyncio.DatagramProtocol):
-    '''UDP client protocol for receiving and processing packets'''
+class Protocol:
+    '''Defines our UDP client protocol factory for receiving and processing datagram packets'''
     def __init__(self, reader):
-        super().__init__()
         self.reader = reader
 
     def connection_made(self, transport):
@@ -291,44 +288,40 @@ class Protocol(asyncio.DatagramProtocol):
 class Reader(Header):
     '''Defines methods for receiving packets, and reading the stream of NOAAPort products.
  
-    sbn_message = the data product portion of the packet - as raw bytes (aka, the file content)\n
-    packet = flh + time_sync # when flh.SBN_command is 5 or TIME_SYNC_CMD\n
-    packet = flh + sbn + sbn_message # when sbn.Header_length is 16 or DATA_HEADER_LENGTH\n
-    packet = flh + sbn + psh + wmo + sbn_message # when sbn.Block_number is 0, first packet\n
-    where flh + sbn + psh + wmo = ccb # the NWSTG Communications Control Block - only in product's first packet\n
+    sbn_message = the data product portion of the packet - as raw bytes (aka, the file content)
+    packet = flh + time_sync # when flh.SBN_command is 5 or TIME_SYNC_CMD
+    packet = flh + sbn + sbn_message # when sbn.Header_length is 16 or DATA_HEADER_LENGTH
+    packet = flh + sbn + psh + wmo + sbn_message # when sbn.Block_number is 0, first packet
+    where flh + sbn + psh + wmo = ccb # the NWSTG Communications Control Block - only in product's first packet
     The final packet for a product is marked by
       - a first packet where psh.num_frags is 0
-      - sbn.Transfer_type is 6 or TRANSFER_LAST_PACKET (last packet for product)
-      - sbn.Transfer_type is 22 or TRANSFER_ABORT (product abort, in hex)
+      - an sbn.Transfer_type of 6 or TRANSFER_LAST_PACKET (last packet for product)
+      - an sbn.Transfer_type of 22 or TRANSFER_ABORT (product abort, in hex)
     '''
 
     CHANNELS = [str(i) for i in range(1,12)] # the range of valid NOAAPort channels
     BUFFER_MAX = 65507 # how many bytes (max) to read or receive from the socket
     FIRST_BYTES = 8 # How many bytes, at the start of the data, to scan to determine the file type
 
-    def __init__(self, channel: int, cue, dest: str, logdir:str = None, verbose: int = 0):
-        '''Initializes a NOAAPort reader on the given channel with logging.
+    def __init__(self, channel:int, queue:Queue, logdir:str = None, verbose:int = 0):
+        '''Initializes a NOAAPort reader instance on the given channel with logging.
         Args:
             channel (int): The channel to listen to.
-            cue (Queue): The queue we will add products to, to be written by the Worker
-            dest (str): The destination for received products.
+            queue (Queue): The queue we will add products to, to be written by the Worker
             logdir (str, optional): The directory to write logs to. Defaults to None.
             verbose (int, optional): The verbosity level for logging. Defaults to 0.'''
-        self.filepath = None
+        self.filename = None
         self.verbose = verbose
-        self.queue = cue
+        self.queue = queue
         self.set_channel(channel)
         self.logger = setup_logger(f'NOAAPort_reader.{int(self.channel):02d}', logdir)
         self.expected_sequence = 0 # The sbn sequence number is expected to increment by 1
-        self.data_dir = Path(dest, self.channel)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        # self.ldm_lib = ctypes.CDLL('/path/to/ldm.so') # Load the LDM shared library
         self.setup_socket()
         loop = asyncio.get_event_loop()
-        connect = loop.create_datagram_endpoint(lambda: Protocol(self), sock=self.sock)
-        transport, protocol = loop.run_until_complete(connect)
+        listen = loop.create_datagram_endpoint(lambda: Protocol(self), sock=self.sock)
+        loop.run_until_complete(listen)
 
-    def set_channel(self, channel: int):
+    def set_channel(self, channel:int):
         '''Sets the channel we will be listening on'''
         self.channel = str(channel)
         if self.channel == '11':
@@ -339,29 +332,29 @@ class Reader(Header):
             self.port = 1200 + int(channel)
 
     def setup_socket(self) -> None:
-        '''Opens a socket for communication. Set up options for a socket instance, and bind to it for receiving'''
+        '''Set our socket options for UDP communication, bind to it for receiving, and join the multicast group'''
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.sock.bind(('', self.port))
-            mreq = pack("=4sl", socket.inet_aton(self.ip), socket.INADDR_ANY)
-            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            self.logger.info(f'Setting up a socket to {self.ip}:{self.port} while '
-                    f'listening to NOAAPort channel {self.channel}')
+            self.sock.bind((self.ip, self.port))
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                 socket.inet_aton(self.ip) + socket.inet_aton(LOCAL_IP))
+            self.logger.info(f'Setting up a socket to {self.ip}:{self.port} from interface {LOCAL_IP} while '
+                             f'listening to NOAAPort channel {self.channel}')
         except socket.error as e:
             self.logger.error(f'Failed to open socket: {e}')
             raise e
 
     def add_to_queue(self):
-        '''Adds the current file path and message (and metadata) to the queue for writing. Also resets
+        '''Adds the current file product and json metadata to the queue for writing. Also resets
         the file path and closes our instance buffers, in preparation for the next data product.'''
-        self.queue.put_nowait((self.filepath, self.sbn_json.getvalue(), False))
-        self.queue.put_nowait((self.filepath, self.sbn_message.getvalue(), True))
-        self.filepath = None
+        self.queue.put_nowait( (self.filename, self.sbn_json.getvalue(), False) )
+        self.queue.put_nowait( (self.filename, self.sbn_message.getvalue(), True) )
+        self.filename = None
         self.sbn_json.close()
         self.sbn_message.close()
 
-    def read_first_packet(self, data: bytes, verbose:int = 0):
+    def read_first_packet(self, data:bytes, verbose:int = 0):
         '''Read and process the first packet for a product set (which may be a complete product).
         This contains our full product information and metadata, sets our filename and extension'''
         psh_start = self.FLH_SIZE + self.SBN_SIZE
@@ -377,24 +370,23 @@ class Reader(Header):
             return
         if ext == 'none' and self.nexrad3_wmo_finder.search(wmo.header):
             ext = 'nexrad3'
-        filename = '.'.join(['NOAAPORT',prod_cat, wmo.wmo_id, wmo.station, wmo.ymd[6:8]+wmo.ymd[9:],
+        self.filename = Path(self.channel) / '.'.join(['NOAAPORT',prod_cat, wmo.wmo_id, wmo.station, wmo.ymd[6:8]+wmo.ymd[9:],
           datetime.now(timezone.utc).strftime("%Y%j%H%M%S%f")[:-3], wmo.awips, ext]).replace('..', '.')
-        self.filepath = Path(self.data_dir, filename)
         if verbose:
-            self.logger.info(f'Receiving product {self.filepath} ({psh.num_frags} frags) q:{self.queue.qsize()}')
+            self.logger.info(f'Receiving product {self.filename} ({psh.num_frags} frags) q:{self.queue.qsize()}')
         self.sbn_message = BytesIO()
         self.sbn_json = StringIO()
         self.sbn_message.write(data[data_start:])
-        self.sbn_json.write(json.dumps({'product_info':f'{datetime.now(timezone.utc)} {filename} '
+        self.sbn_json.write(json.dumps({'product_info':f'{datetime.now(timezone.utc)} {self.filename} '
           f'({psh.num_frags} fragments)', f'packet_{self.sbn.Block_number}_meta': self.packet_meta,
           'FLH':self.flh._asdict(), 'SBN':self.sbn._asdict(), 'PSH':psh._asdict(),
           'WMO':wmo._asdict()}, indent=2, separators=(',', ': ')))
         if psh.num_frags == 0:
             self.add_to_queue()
 
-    def read_data_packet(self, data: bytes, verbose:int = 0):
-        '''Read a data packet, which contains just binary data beyond the abbreviated (flh + sbn) header'''
-        if self.filepath is not None:
+    def read_data_packet(self, data:bytes, verbose:int = 0):
+        '''Read a data packet, which contains just the sbn message (binary data) (beyond the abbreviated flh + sbn header)'''
+        if self.filename is not None:
             self.sbn_message.write(data)
             self.sbn_json.write(',')
             self.sbn_json.write(json.dumps({f'packet_{self.sbn.Block_number}_meta':self.packet_meta,
@@ -405,7 +397,7 @@ class Reader(Header):
             self.logger.debug(f' Reading data packet without the product spec / info (fragment# {self.sbn.Block_number})')
 
     def process_packet(self, data:bytes, host:str, port:int):
-        '''As data packets arrive, route to the appropriate Header class read method\n
+        '''As data packets arrive, route to the appropriate Header class read method.\n
         Read the header variable values for the packets received (following NOAAPort formats and conventions)'''
         verbose = self.verbose
         self.packet_meta = (f'{datetime.now(timezone.utc)} Received packet ({len(data)} bytes) '
@@ -430,54 +422,67 @@ class Reader(Header):
           f'flh: {self.flh}, sbn: {self.sbn}.')
 
 class Worker(Thread):
-    '''Define some methods to manage the NOAAPort workload - queue the received packets and write file products.'''
+    '''Define some methods to manage the NOAAPort workload - process the shared queue and write file products.'''
 
-    def __init__(self, logdir:str, verbose:int):
+    def __init__(self, args:Namespace):
         Thread.__init__(self, name='NOAAPort_writer_thread', daemon=True)
-        self.logger = setup_logger('NOAAPort_writer', logdir)
-        self.verbose = verbose
+        self.logger = setup_logger('NOAAPort_writer', args.logdir)
+        self.verbose = args.verbose
         self.queue = Queue() # Sets up the queue for processing data
+        self.json_out = args.json
+        self.dest = args.dest
+        self.send_ldm = args.ldm
+        self.setup_dest(args)
+
+    def setup_dest(self, args:Namespace):
+        '''Conditionally provision directories when writing (meta)data locally'''
+        if not self.send_ldm or self.json_out:
+            channels = [args.channel] if args.channel != 'all' else Reader.CHANNELS
+            for channel in channels:
+                Path(args.dest, channel).mkdir(parents=True, exist_ok=True)
 
     def run(self):
         '''Continuously consumes items from the queue and writes the data to the appropriate location.'''
         while True:
             try:
-                filepath, buffer, binary = self.queue.get()
+                filename, buffer, message = self.queue.get()
             except IndexError:
                 continue # continue when queue is empty
-            if str(filepath).startswith('ldm:/'):
-                self.write_to_ldm(self, filepath, buffer)
-            elif binary:
-                self.write_data(filepath, buffer)
-            else:
-                self.write_json(filepath, buffer)
 
-    def write_data(self, filepath:str, buffer:bytes):
-        '''Writes the given binary data to the specified file.'''
-        if self.verbose > 1: self.logger.debug(f'  writing sbn_message to file {filepath} of size '
+            if self.send_ldm and message:
+                self.write_to_ldm(filename, buffer)
+            if self.json_out and not message:
+                self.write_json(filename, buffer)
+            if not self.send_ldm and message: # and os.isvalid_dir(self.dest)
+                self.write_data(filename, buffer)
+
+    def write_data(self, filename:str, buffer:bytes):
+        '''Writes the given message or product (binary data) to the specified file.'''
+        if self.verbose > 1: self.logger.debug(f'  writing sbn_message to file {filename} of size '
           f'{human_size(len(buffer))}')
-        with filepath.open('wb') as data_file:
+        with Path(self.dest, filename).open('wb') as data_file:
             data_file.write(buffer)
 
-    def write_json(self, filepath:str, buffer:str):
+    def write_json(self, filename:str, buffer:str):
         '''Writes the given JSON metadata to the specified file.'''
-        if self.verbose > 1: self.logger.debug(f'  writing metadata to file {filepath.with_suffix(".json")}')
-        with filepath.with_suffix('.json').open('w', encoding="utf-8") as json_file:
+        if self.verbose > 1: self.logger.debug(f'  writing metadata to file {Path(filename).with_suffix(".json")}')
+        with Path(self.dest, filename).with_suffix('.json').open('w', encoding="utf-8") as json_file:
             json_file.write(buffer)
 
-    def write_to_ldm(self, filepath:str, buffer:Any):
+    def write_to_ldm(self, filename:str, buffer:IO):
         '''Writes the given data to LDM, inserting into the LDM queue via the shared library.'''
-        if self.verbose >= 2: self.logger.debug(f'  writing to LDM sbn_message {filepath} of size '
+        if self.verbose >= 2: self.logger.debug(f'  writing to LDM sbn_message {filename} of size '
           f'{human_size(len(buffer))}')
+        return # still under development
         try:
             # Call the function to insert data into the LDM queue
-            result = self.ldm_lib.insert_into_ldm(filepath[5:], buffer)
+            result = self.ldm_lib.insert_into_ldm(filename, buffer)
             if result != 0:
                 raise Exception('Failed to insert data into LDM queue')
         except Exception as e:
             self.logger.error('Failed to insert data into LDM queue: %s', e)
 
-def get_extension(first_bytes: bytes) -> str:
+def get_extension(first_bytes:bytes) -> str:
     '''Determines the file extension based on the first few bytes of the file.'''
     ext = 'none'
     if b'GRIB' in first_bytes:
@@ -500,19 +505,19 @@ def get_extension(first_bytes: bytes) -> str:
         ext = 'xml'
     return ext
 
-def human_time(epoch_secs: int) -> str:
-    '''Converts epoch time to human-readable time.'''
+def human_time(epoch_secs:int) -> str:
+    '''Converts epoch time to a human-readable time string.'''
     my_time_struct = gmtime(epoch_secs)
     my_time = datetime(*my_time_struct[:6], tzinfo=timezone.utc)
     return my_time.strftime('%Y_%m_%d_%H:%M:%S')
 
-def human_size(size: str, units = None) -> str:
+def human_size(size:str, units = None) -> str:
     '''Converts size in bytes to human-readable format.'''
     if units is None: units = [' bytes','KB','MB','GB','TB', 'PB', 'EB']
     return f"{float(size):.1f}{units[0]}" if float(size)<1024 else human_size(size/1024, units[1:])
 
-def setup_logger(name:str = 'NOAAPort_reader', logdir:str = None):
-    '''Sets up the logger for this class, noting the directory to write logs to.'''
+def setup_logger(name:str, logdir:str = None):
+    '''Sets up a logger object, noting the directory to write logs to.'''
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(name)
     if logdir is not None:
@@ -524,26 +529,30 @@ def setup_logger(name:str = 'NOAAPort_reader', logdir:str = None):
         logger.addHandler(file_handler)
     return logger
 
-def parse_args(description: str) -> ArgumentParser:
+def parse_args(description:str) -> ArgumentParser:
     '''Parses command-line arguments, noting the program description for the help message.'''
     parser = ArgumentParser(description=description)
     parser.add_argument('channel', help='Specify the channel you want to listen to',
       choices=Reader.CHANNELS + ['all'])
     parser.add_argument('-v', '--verbose', help='Make output more verbose. Can be used '
       'multiple times.', action='count', default=0)
-    parser.add_argument('-d', '--dest', help='Specify the destination for received products',
-      type=str, default='/data/temp/')
+    parser.add_argument('-d', '--dest', type=str, default='/data/temp/',
+      help='Specify destination directory for received products, default to /data/temp')
     parser.add_argument('-l', '--logdir', help='Specify the directory to write logs to',
       type=str, default=None)
+    parser.add_argument('--json', action="store_true",
+      help='Create metadata from the received packets of NOAAPort products')
+    parser.add_argument('--ldm', action='store_true',
+      help='Insert the NOAAPort file products into the LDM queue')
     return parser.parse_args()
 
 def catch_signals():
     '''Sets up signal handling. This function catches all signals that can be caught,
     and sets up a signal handler for them.
-    The signal handler logs the signal, closes all sockets, and exits the program.'''
+    The signal handler logs the signal, stops the event loop, and exits the program.'''
     logger = logging.getLogger(Path(__file__).name + '_catch_signals') # provide a local logger
 
-    def sig_handler(signum: int, frame):
+    def sig_handler(signum:int, frame):
         '''Handles received system signals and performs cleanup operations.
         Args:
             signum (int): The signal number.
@@ -551,23 +560,28 @@ def catch_signals():
         signame = signal.Signals(signum).name
         logger.info(f'Signal handler called with signal name:{signame},'
                 f' num:{signum}') #  (frame: {frame})')
-        os._exit(0) # sys.exit(0)
+        loop = asyncio.get_event_loop()
+        loop.stop()
+        sys.exit(0)
 
     catchable_sigs = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP, signal.SIGWINCH}
     for sig in catchable_sigs:
         signal.signal(sig, sig_handler)
 
 def main():
-    '''The main function of the program. Parses arguments, starts readers, and handles signals.'''
+    '''The main function of the program. Parses arguments, starts reader(s), a worker and handles signals.'''
     catch_signals()
     args = parse_args(DESC)
     channels = [args.channel] if args.channel != 'all' else Reader.CHANNELS
-    worker = Worker(args.logdir, args.verbose)
+    worker = Worker(args)
     for ch in channels:
         Reader(ch, worker.queue, args.dest, args.logdir, args.verbose)
     worker.start()
     loop = asyncio.get_event_loop()
-    loop.run_forever()
+    try:
+        loop.run_forever()
+    finally:
+        loop.close()
 
 if __name__ == '__main__':
     main()
